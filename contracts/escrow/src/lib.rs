@@ -56,6 +56,9 @@ pub struct Escrow {
     pub deadline: u64,
     pub funded_amount: i128,
     pub memo: String,
+    /// Whether the escrow has been cancelled by an authorized signer.
+    /// When true, the sender can clawback funds regardless of deadline.
+    pub cancelled: bool,
 }
 
 #[contracttype]
@@ -131,6 +134,7 @@ impl EscrowContract {
             deadline,
             funded_amount: amount,
             memo,
+            cancelled: false,
         };
         env.storage()
             .persistent()
@@ -180,6 +184,7 @@ impl EscrowContract {
             deadline: unlock_time,
             funded_amount: 0,
             memo,
+            cancelled: false,
         };
         env.storage()
             .persistent()
@@ -336,6 +341,63 @@ impl EscrowContract {
         env.events().publish(
             (symbol_short!("escrow"), symbol_short!("ref_tl")),
             (id, caller),
+        );
+        Ok(())
+    }
+
+    /// Cancel a funded escrow, allowing the sender to clawback funds.
+    /// Callable only by the sender (organization) or arbiter. Sets the
+    /// `cancelled` flag which enables immediate clawback without waiting
+    /// for the deadline.
+    pub fn cancel(env: Env, caller: Address, id: u64) -> Result<(), Error> {
+        caller.require_auth();
+        let mut escrow = Self::load(&env, id)?;
+        if !matches!(escrow.state, EscrowState::Funded | EscrowState::Created) {
+            return Err(Error::InvalidState);
+        }
+        if caller != escrow.sender && caller != escrow.arbiter {
+            return Err(Error::Unauthorized);
+        }
+        escrow.cancelled = true;
+        Self::store(&env, id, &escrow);
+        env.events()
+            .publish((symbol_short!("escrow"), symbol_short!("cancelled")), (id, caller));
+        Ok(())
+    }
+
+    /// Clawback funds from a funded escrow back to the sender (organization).
+    /// Callable only by the sender after:
+    /// - The deadline has expired, OR
+    /// - The escrow has been cancelled by an authorized signer.
+    ///
+    /// This ensures funds do not remain permanently trapped if a beneficiary
+    /// becomes unresponsive or a project is canceled.
+    pub fn clawback(env: Env, sender: Address, id: u64) -> Result<(), Error> {
+        sender.require_auth();
+        let mut escrow = Self::load(&env, id)?;
+        if escrow.sender != sender {
+            return Err(Error::Unauthorized);
+        }
+        if !matches!(escrow.state, EscrowState::Funded | EscrowState::Expired) {
+            return Err(Error::InvalidState);
+        }
+        // Clawback is allowed if:
+        // 1. The escrow is cancelled (governance override), OR
+        // 2. The deadline has expired (timeout condition)
+        if !escrow.cancelled && env.ledger().timestamp() < escrow.deadline {
+            return Err(Error::InvalidState);
+        }
+        escrow.state = EscrowState::Refunded;
+        Self::store(&env, id, &escrow);
+        // Transfer the real tokens back to the sender (organization treasury).
+        token::TokenClient::new(&env, &escrow.asset).transfer(
+            &env.current_contract_address(),
+            &escrow.sender,
+            &escrow.funded_amount,
+        );
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("clawback")),
+            (id, sender, escrow.funded_amount),
         );
         Ok(())
     }

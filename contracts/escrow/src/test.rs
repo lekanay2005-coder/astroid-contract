@@ -226,3 +226,159 @@ fn create_rejects_bad_input() {
     // No successful escrow was created, so the sender keeps every token.
     assert_eq!(balance(&h, &h.sender), 5_000);
 }
+
+// --- Clawback tests ---
+
+#[test]
+fn clawback_after_timeout_succeeds() {
+    let h = setup(5_000);
+    let id = create(&h, 5_000, START + 100);
+
+    // Advance past the deadline.
+    h.env.ledger().with_mut(|l| l.timestamp = START + 200);
+
+    // Sender can clawback after timeout.
+    h.client.clawback(&h.sender, &id);
+    assert_eq!(h.client.get(&id).state, EscrowState::Refunded);
+    // The sender got the real tokens back; custody is empty.
+    assert_eq!(balance(&h, &h.sender), 5_000);
+    assert_eq!(balance(&h, &h.client.address), 0);
+}
+
+#[test]
+fn clawback_before_timeout_rejected() {
+    let h = setup(5_000);
+    let id = create(&h, 5_000, START + 100);
+
+    // Cannot clawback before deadline without cancellation.
+    let res = h.client.try_clawback(&h.sender, &id);
+    assert_eq!(res, Err(Ok(Error::InvalidState)));
+    assert_eq!(balance(&h, &h.client.address), 5_000);
+}
+
+#[test]
+fn clawback_after_cancel_always_succeeds() {
+    let h = setup(5_000);
+    let id = create(&h, 5_000, START + 100_000);
+
+    // Cancel the escrow (before deadline).
+    h.client.cancel(&h.sender, &id);
+    assert!(h.client.get(&id).cancelled);
+
+    // Sender can immediately clawback because escrow is cancelled.
+    h.client.clawback(&h.sender, &id);
+    assert_eq!(h.client.get(&id).state, EscrowState::Refunded);
+    assert_eq!(balance(&h, &h.sender), 5_000);
+    assert_eq!(balance(&h, &h.client.address), 0);
+}
+
+#[test]
+fn arbiter_can_cancel_for_clawback() {
+    let h = setup(5_000);
+    let id = create(&h, 5_000, START + 100_000);
+
+    // Arbiter can cancel the escrow.
+    h.client.cancel(&h.arbiter, &id);
+    assert!(h.client.get(&id).cancelled);
+
+    // Sender (organization) can now clawback.
+    h.client.clawback(&h.sender, &id);
+    assert_eq!(h.client.get(&id).state, EscrowState::Refunded);
+    assert_eq!(balance(&h, &h.sender), 5_000);
+}
+
+#[test]
+fn non_sender_cannot_clawback() {
+    let h = setup(5_000);
+    let id = create(&h, 5_000, START + 100);
+
+    // Advance past the deadline.
+    h.env.ledger().with_mut(|l| l.timestamp = START + 200);
+
+    // Recipient or arbiter cannot clawback — only the sender.
+    let res = h.client.try_clawback(&h.recipient, &id);
+    assert_eq!(res, Err(Ok(Error::Unauthorized)));
+}
+
+#[test]
+fn non_authorized_cannot_cancel() {
+    let h = setup(5_000);
+    let id = create(&h, 5_000, START + 100_000);
+
+    let intruder = Address::generate(&h.env);
+    let res = h.client.try_cancel(&intruder, &id);
+    assert_eq!(res, Err(Ok(Error::Unauthorized)));
+    assert!(!h.client.get(&id).cancelled);
+}
+
+#[test]
+fn clawback_rejected_after_release() {
+    let h = setup(5_000);
+    let id = create(&h, 5_000, START + 100);
+
+    // Release the escrow to the recipient.
+    h.client.release(&h.arbiter, &id);
+    assert_eq!(h.client.get(&id).state, EscrowState::Released);
+
+    // Even past the deadline, clawback on a released escrow is invalid.
+    h.env.ledger().with_mut(|l| l.timestamp = START + 200);
+    let res = h.client.try_clawback(&h.sender, &id);
+    assert_eq!(res, Err(Ok(Error::InvalidState)));
+    // Funds already moved to recipient — nothing left.
+    assert_eq!(balance(&h, &h.recipient), 5_000);
+    assert_eq!(balance(&h, &h.client.address), 0);
+}
+
+#[test]
+fn clawback_event_emitted_on_success() {
+    let h = setup(5_000);
+    let id = create(&h, 5_000, START + 100);
+
+    // Advance past the deadline.
+    h.env.ledger().with_mut(|l| l.timestamp = START + 200);
+
+    // Verify the event is published (this test will fail if the event is missing).
+    let events = h.env.events().all();
+    let initial_event_count = events.len();
+
+    h.client.clawback(&h.sender, &id);
+
+    let events = h.env.events().all();
+    assert!(events.len() > initial_event_count as u32);
+    // The clawback event should be the last one published.
+    let last_event = &events[events.len() - 1];
+    assert_eq!(last_event.topics[0], symbol_short!("escrow"));
+    assert_eq!(last_event.topics[1], symbol_short!("clawback"));
+}
+
+#[test]
+fn cancel_and_clawback_time_lock_escrow() {
+    let h = setup(5_000);
+    let token_admin = Address::generate(&h.env);
+    let asset = h
+        .env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+    token::StellarAssetClient::new(&h.env, &asset).mint(&h.sender, &3_000);
+
+    let id = h.client.initialize_timelock(
+        &h.sender,
+        &h.recipient,
+        &h.arbiter,
+        &asset,
+        &3_000,
+        &(START + 100_000),
+        &String::from_str(&h.env, "time-lock"),
+    );
+    assert_eq!(h.client.get(&id).state, EscrowState::Created);
+    assert_eq!(h.client.get(&id).funded_amount, 0);
+
+    // Cancel the time-locked escrow.
+    h.client.cancel(&h.sender, &id);
+    assert!(h.client.get(&id).cancelled);
+
+    // Note: clawback requires state == Funded or Expired.
+    // Created state is not supported for clawback — this is by design.
+    let res = h.client.try_clawback(&h.sender, &id);
+    assert_eq!(res, Err(Ok(Error::InvalidState)));
+}
