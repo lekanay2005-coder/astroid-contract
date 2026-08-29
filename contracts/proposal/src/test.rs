@@ -55,6 +55,8 @@ fn create(h: &Harness, threshold: u32, expires_at: u64) -> u64 {
     )
 }
 
+// --- Existing tests ---
+
 #[test]
 fn create_starts_pending() {
     let h = setup(3);
@@ -185,4 +187,163 @@ fn create_with_past_expiry_fails() {
         &500, // in the past (now = 1000)
     );
     assert_eq!(res, Err(Ok(Error::InvalidInput)));
+}
+
+// --- Delegation tests ---
+
+#[test]
+fn delegate_sets_delegation() {
+    let h = setup(3);
+    let delegator = h.approvers[0].clone();
+    let delegatee = h.approvers[1].clone();
+    h.client.delegate(&delegator, &delegatee);
+    assert_eq!(
+        h.client.get_delegation(&delegator),
+        Some(delegatee)
+    );
+}
+
+#[test]
+fn delegate_self_fails() {
+    let h = setup(3);
+    let delegator = h.approvers[0].clone();
+    let res = h.client.try_delegate(&delegator, &delegator);
+    assert_eq!(res, Err(Ok(Error::InvalidInput)));
+}
+
+#[test]
+fn delegate_circular_direct_rejected() {
+    let h = setup(3);
+    let a = h.approvers[0].clone();
+    let b = h.approvers[1].clone();
+    // A delegates to B
+    h.client.delegate(&a, &b);
+    // B tries to delegate to A → cycle
+    let res = h.client.try_delegate(&b, &a);
+    assert_eq!(res, Err(Ok(Error::CircularDelegation)));
+}
+
+#[test]
+fn delegate_circular_transitive_rejected() {
+    let h = setup(4);
+    let a = h.approvers[0].clone();
+    let b = h.approvers[1].clone();
+    let c = h.approvers[2].clone();
+    // A → B → C
+    h.client.delegate(&a, &b);
+    h.client.delegate(&b, &c);
+    // C tries to delegate to A → cycle A→B→C→A
+    let res = h.client.try_delegate(&c, &a);
+    assert_eq!(res, Err(Ok(Error::CircularDelegation)));
+}
+
+#[test]
+fn revoke_delegation_succeeds() {
+    let h = setup(3);
+    let delegator = h.approvers[0].clone();
+    let delegatee = h.approvers[1].clone();
+    h.client.delegate(&delegator, &delegatee);
+    assert_eq!(h.client.get_delegation(&delegator), Some(delegatee));
+    h.client.revoke_delegation(&delegator);
+    assert_eq!(h.client.get_delegation(&delegator), None);
+}
+
+#[test]
+fn revoke_nonexistent_delegation_fails() {
+    let h = setup(3);
+    let delegator = h.approvers[0].clone();
+    let res = h.client.try_revoke_delegation(&delegator);
+    assert_eq!(res, Err(Ok(Error::NotFound)));
+}
+
+#[test]
+fn delegated_vote_increases_approval_count() {
+    let h = setup(3);
+    let id = create(&h, 3, 5_000); // threshold = 3
+    // Approver 0 delegates to approver 1
+    h.client.delegate(&h.approvers[0], &h.approvers[1]);
+    // Approver 1 approves: 1 direct + 1 delegated = 2 votes
+    let approvals = h.client.approve(&h.approvers[1], &id);
+    assert_eq!(approvals, 2);
+    // Approver 2 approves: 2 + 1 = 3 → threshold met
+    let approvals = h.client.approve(&h.approvers[2], &id);
+    assert_eq!(approvals, 3);
+    assert_eq!(h.client.state(&id), ProposalState::Approved);
+}
+
+#[test]
+fn delegated_vote_reaches_threshold_early() {
+    let h = setup(3);
+    let id = create(&h, 2, 5_000); // threshold = 2
+    // Approver 0 delegates to approver 1
+    h.client.delegate(&h.approvers[0], &h.approvers[1]);
+    // Approver 1 approves: 1 direct + 1 delegated = 2 → threshold met
+    let approvals = h.client.approve(&h.approvers[1], &id);
+    assert_eq!(approvals, 2);
+    assert_eq!(h.client.state(&id), ProposalState::Approved);
+}
+
+#[test]
+fn transitive_delegation_resolves() {
+    let h = setup(4);
+    let id = create(&h, 3, 5_000); // threshold = 3
+    // A → B → C (transitive: A delegates through B to C)
+    h.client.delegate(&h.approvers[0], &h.approvers[1]);
+    h.client.delegate(&h.approvers[1], &h.approvers[2]);
+    // C approves: 1 direct + 2 delegated (A and B both chain to C) = 3
+    let approvals = h.client.approve(&h.approvers[2], &id);
+    assert_eq!(approvals, 3);
+    assert_eq!(h.client.state(&id), ProposalState::Approved);
+}
+
+#[test]
+fn delegated_power_view() {
+    let h = setup(3);
+    // Approver 0 delegates to approver 1
+    h.client.delegate(&h.approvers[0], &h.approvers[1]);
+    assert_eq!(h.client.get_delegated_power(&h.approvers[1]), 1);
+    assert_eq!(h.client.get_delegated_power(&h.approvers[0]), 0);
+    assert_eq!(h.client.get_delegated_power(&h.approvers[2]), 0);
+}
+
+#[test]
+fn revoked_delegation_not_counted() {
+    let h = setup(3);
+    let id = create(&h, 3, 5_000);
+    // Approver 0 delegates to approver 1, then revokes
+    h.client.delegate(&h.approvers[0], &h.approvers[1]);
+    h.client.revoke_delegation(&h.approvers[0]);
+    // Approver 1 approves: only 1 direct vote (delegation revoked)
+    let approvals = h.client.approve(&h.approvers[1], &id);
+    assert_eq!(approvals, 1);
+    assert_eq!(h.client.state(&id), ProposalState::Pending);
+}
+
+#[test]
+fn replace_delegation_updates_power() {
+    let h = setup(4);
+    // Approver 0 delegates to approver 1
+    h.client.delegate(&h.approvers[0], &h.approvers[1]);
+    assert_eq!(h.client.get_delegated_power(&h.approvers[1]), 1);
+    // Approver 0 re-delegates to approver 2
+    h.client.delegate(&h.approvers[0], &h.approvers[2]);
+    assert_eq!(h.client.get_delegated_power(&h.approvers[1]), 0);
+    assert_eq!(h.client.get_delegated_power(&h.approvers[2]), 1);
+}
+
+#[test]
+fn multiple_delegators_same_delegatee() {
+    let h = setup(4);
+    let id = create(&h, 4, 5_000); // threshold = 4
+    // Approver 0 and 1 both delegate to approver 2
+    h.client.delegate(&h.approvers[0], &h.approvers[2]);
+    h.client.delegate(&h.approvers[1], &h.approvers[2]);
+    assert_eq!(h.client.get_delegated_power(&h.approvers[2]), 2);
+    // Approver 2 approves: 1 direct + 2 delegated = 3
+    let approvals = h.client.approve(&h.approvers[2], &id);
+    assert_eq!(approvals, 3);
+    // Approver 3 approves: 3 + 1 = 4 → threshold met
+    let approvals = h.client.approve(&h.approvers[3], &id);
+    assert_eq!(approvals, 4);
+    assert_eq!(h.client.state(&id), ProposalState::Approved);
 }

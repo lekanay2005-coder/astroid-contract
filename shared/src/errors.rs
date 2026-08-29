@@ -60,6 +60,8 @@ pub enum Error {
     InvalidProposalState = 71,
     ProposalNotApproved = 72,
     NotAnApprover = 73,
+    CircularDelegation = 74,
+    DelegationDepthExceeded = 75,
 
     // --- Escrow (80-89) ---
     ConditionNotMet = 80,
